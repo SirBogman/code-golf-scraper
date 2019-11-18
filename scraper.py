@@ -2,13 +2,15 @@
 """Download all of the scores from code-golf.io and create a spreadsheet showing how the proposed
 Bayesian scoring method will affect things."""
 
+import json
 import os
-import re
 import sqlite3
 from argparse import ArgumentParser
-from collections import defaultdict
+from datetime import datetime
 from dataclasses import dataclass
 from math import ceil, floor, isclose
+from time import time
+from typing import Dict, List
 
 import requests
 import xlsxwriter
@@ -17,163 +19,79 @@ DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 @dataclass
-class UserInfo:
-    """Represents a user's overall score."""
-    name: str
-    score: int
+class LeaderboardEntry:
+    """Represents a score as it appears on a leaderboard."""
+    user: str
+    lang: str
+    points: int
     rank: int
     holes: int
+    strokes: int
+    submitted: str
 
 
 @dataclass
 class SolutionInfo:
     """Represents a solution to a hole."""
-    rank: int
     user: str
-    language: str
+    lang: str
     hole: str
-    chars: int
-    score: int
-    sort_index: int
+    strokes: int
+    submitted: str
 
 
-SHORT_REGEX = re.compile(r'<tr><td>(?P<rank>[\d,]+)<sup>\w+</sup>')
+def get_file_path(name: str) -> str:
+    """Get a local path for caching a json file."""
+    return os.path.join(DIR, 'scores', f'{name}.json')
 
-SOLUTION_REGEX = re.compile(
-    r'<tr><td>(?P<rank>[\d,]+)<sup>\w+</sup>'
-    r'<td><img src="[^"]+"><a href="/users/(?P<user>[\-\w]+)">(?P=user)</a>'
-    r'<td class=(?P<language>\w+)>(?P<chars>[\d,]+)'
-    r'<td>\((?P<score>[\d,]+) points?\)'
-    r'<td><time datetime=(?P<date>\d{4}-\d{2}-\d{2})T(?P<time>\d{2}:\d{2}:\d{2})Z>[\s\w]+</time>')
-
-TOTAL_SCORES_REGEX = re.compile(
-    r'<tr><td>(?P<rank>[\d,]+)<sup>\w+</sup>'
-    r'<td><img src="[^"]+"><a href="/users/(?P<user>[\-\w]+)">(?P=user)</a>'
-    r'<td>(?P<score>[\d,]+)'
-    r'<td>\((?P<holes>[\d,]+) holes?\)'
-    r'<td><time datetime=(?P<date>\d{4}-\d{2}-\d{2})T(?P<time>\d{2}:\d{2}:\d{2})Z>[\s\w]+</time>')
-
-
-def get_from_web(hole):
-    """Get html for a hole from the web."""
-    return requests.get(f'https://code-golf.io/scores/{hole}/all-langs').text
+def get_from_web() -> List[Dict]:
+    """Get list of solutions from the web."""
+    text = requests.get('https://code-golf.io/scores/all-holes/all-langs/all').content.decode()
+    # Write the data to two files, one of which has the timestamp in its name.
+    timestamp = datetime.now().isoformat(timespec='seconds').replace(':', '-')
+    with open(get_file_path(timestamp), 'w', encoding='utf-8') as file:
+        file.write(text)
+    with open(get_file_path('all'), 'w', encoding='utf-8') as file:
+        file.write(text)
+    return json.loads(text)
 
 
-def get_file_path(hole):
-    """Get a local path for caching an html file."""
-    return os.path.join(DIR, 'scores', hole + '.html')
+def get_from_file() -> List[Dict]:
+    """Get list of solutions from a local file."""
+    with open(get_file_path('all'), 'r', encoding='utf-8') as file:
+        return json.load(file)
 
 
-def get_from_file(hole):
-    """Get html for a hole from a file."""
-    with open(get_file_path(hole), 'r', encoding='utf-8') as file:
-        return file.read()
-
-
-def _parse_solution(hole, match, count):
-    return SolutionInfo(
-        rank=int(match.group('rank').replace(',', '')),
-        user=match.group('user'),
-        language=match.group('language'),
-        hole=hole,
-        chars=int(match.group('chars').replace(',', '')),
-        score=int(match.group('score').replace(',', '')),
-        sort_index=count + 1)
-
-
-def process_hole_list(html):
-    """Parse the list of all holes."""
-    match = re.search(r'<select id=hole>(.*?)</select>', html.replace('\n', ''))
-    if not match:
-        print('Failed to detect holes')
-        exit(1)
-    return set(re.findall('value=([^>]+)>', match.group(0))) - {'all-holes'}
-
-
-def get_holes_and_users(use_local_cache):
-    """Get the hole names and each user's overall score and rank."""
-    if use_local_cache:
-        html = get_from_file('all-holes')
-    else:
-        html = get_from_web('all-holes')
-        with open(get_file_path('all-holes'), 'w', encoding='utf-8') as file:
-            file.write(html)
-    holes = process_hole_list(html)
-    user_infos = {}
-    for match in TOTAL_SCORES_REGEX.finditer(html):
-        user = match.group('user')
-        user_infos[user] = UserInfo(
-            name=user,
-            score=int(match.group('score').replace(',', '')),
-            rank=int(match.group('rank').replace(',', '')),
-            holes=int(match.group('holes').replace(',', '')))
-
-    expected_user_count = len(SHORT_REGEX.findall(html))
-    user_count = len(user_infos)
-    if expected_user_count != user_count:
-        print(f'Expected {expected_user_count} users, but found {user_count}. Check regex.')
-        exit(1)
-    if not user_count:
-        print(f'No users found. Check regex.')
-        exit(1)
-    return holes, user_infos
-
-
-def get_all_solutions(use_local_cache, holes):
+def get_all_solutions(use_local_cache) -> List[SolutionInfo]:
     """Get the user, language, character count, score, rank, and sort index for each solution."""
-    all_solutions = defaultdict(list)
-    for hole in sorted(holes):
-        if use_local_cache:
-            html = get_from_file(hole)
-        else:
-            html = get_from_web(hole)
-            with open(get_file_path(hole), 'w', encoding='utf-8') as file:
-                file.write(html)
+    if use_local_cache:
+        scores = get_from_file()
+    else:
+        scores = get_from_web()
 
-        last_rank = 0
-        next_rank = 1
-        solutions = []
-        for match in SOLUTION_REGEX.finditer(html):
-            info = _parse_solution(hole, match, len(solutions))
-            solutions.append(info)
-            # Make sure we're not missing any scores.
-            if info.rank != last_rank and info.rank != next_rank:
-                print(f'Internal error at rank={info.rank} last_rank={last_rank} in {hole}.')
-                exit(1)
-            last_rank = info.rank
-            next_rank += 1
-
-        all_solutions[hole] = solutions
-        expected_hole_solution_count = len(SHORT_REGEX.findall(html))
-        hole_solution_count = len(solutions)
-        if expected_hole_solution_count != hole_solution_count:
-            print(f'Internal error for {hole}. Expected {expected_hole_solution_count} matches, '
-                  f'but found {hole_solution_count}. Check regex.')
-            exit(1)
-        if not hole_solution_count:
-            print(f'No solutions found for hole {hole}. Check regex.')
-            exit(1)
-    return all_solutions
+    return [SolutionInfo(user=item['login'], hole=item['hole'], lang=item['lang'],
+                         strokes=int(item['strokes']), submitted=item['submitted'])
+            for item in scores]
 
 
-def make_database(cursor, all_scores):
+def make_database(cursor, all_solutions: List[SolutionInfo]):
     """Put all of the solutions into a database for easy querying."""
     cursor.execute('''create table solutions
-        (hole text, user text, language text, size int, score int, rank int, sort_index int,
-         primary key (hole, user, language))''')
+        (hole text, user text, lang text, strokes int, submitted text,
+         primary key (hole, user, lang))''')
     cursor.execute('''create view m_values as
         select
-            language,
+            lang,
             2.0 * NLang / Nmax + 1 as M
           from (
-            select language, count(*) as NLang from solutions group by language
+            select lang, count(*) as NLang from solutions group by lang
           )
           cross join (
-            select count(*) as Nmax from solutions group by language order by count(*) desc limit 1
+            select count(*) as Nmax from solutions group by lang order by count(*) desc limit 1
           )''')
     cursor.execute('''create view bayesian as
         select
-            t1.language,
+            t1.lang,
             t1.hole,
             N,
             M,
@@ -181,55 +99,139 @@ def make_database(cursor, all_scores):
             Sa,
             (N / (N + M)) * S + (M / (N + M)) * Sa as Sb
           from (
-            select language, hole, count(*) as N, min(size) as S
+            select lang, hole, count(*) as N, min(strokes) as S
             from solutions
-            group by language, hole
+            group by lang, hole
           ) as t1
           inner join (
-            select hole, min(size) as Sa from solutions group by hole
+            select hole, min(strokes) as Sa from solutions group by hole
           ) as t2
             on t1.hole = t2.hole
           inner join m_values
-          on t1.language = m_values.language''')
+          on t1.lang = m_values.lang''')
     cursor.execute('''create view scores as
         select
             user,
             hole,
-            language,
+            lang,
             N,
             M,
             S,
             Sa,
             Sb,
-            size,
-            1000 * Sb / size as new_score,
-            score as old_score,
-            rank as old_rank,
-            sort_index as old_sort_index
+            strokes,
+            1000 * Sb / strokes as new_score,
+            submitted
           from solutions
-          inner join bayesian using(language, hole)''')
+          inner join bayesian using(lang, hole)''')
     cursor.execute('''create view total_scores as
         select
             user,
             sum(new_score) as total_score,
-            sum(old_score) as rough_old_total_score,
             count(*) as holes,
-            sum(size) as strokes
+            sum(strokes) as strokes
           from (
             select
                 user,
                 hole,
-                min(size) as size,
-                max(new_score) as new_score,
-                max(old_score) as old_score
+                min(strokes) as strokes,
+                max(new_score) as new_score
               from scores
               group by user, hole
           )
           group by user''')
-    data = [(s.hole, s.user, s.language, s.chars, s.score, s.rank, s.sort_index)
-            for hole_scores in all_scores.values()
-            for s in hole_scores]
-    cursor.executemany('INSERT INTO solutions VALUES (?,?,?,?,?,?,?)', data)
+    data = [(s.hole, s.user, s.lang, s.strokes, s.submitted) for s in all_solutions]
+    cursor.executemany('INSERT INTO solutions (hole, user, lang, strokes, submitted) '
+                       'VALUES (?,?,?,?,?)', data)
+
+
+def get_overall_leaderboard(cursor, lang='all-langs') -> List[LeaderboardEntry]:
+    """Get leaderboard entries for the overall leaderboard."""
+    # sqlite doesn't support PostgreSQL's DISTINCT ON.
+    query = '''
+        WITH augmented_solutions AS (
+          SELECT hole,
+                 user,
+                 strokes,
+                 submitted,
+                 ROW_NUMBER() OVER (PARTITION BY hole, user
+                                    ORDER BY strokes, submitted) hole_user_ordinal
+            FROM solutions
+           WHERE ? IN ('all-langs', lang)
+        ), leaderboard AS (
+          SELECT hole,
+                 user,
+                 strokes,
+                 submitted
+            FROM augmented_solutions
+           WHERE hole_user_ordinal = 1
+        ), scored_leaderboard AS (
+          SELECT hole,
+                 ROUND(
+                     (COUNT(*) OVER (PARTITION BY hole) -
+                        RANK() OVER (PARTITION BY hole ORDER BY strokes) + 1)
+                     * (1000.0 / COUNT(*) OVER (PARTITION BY hole))
+                 ) points,
+                 strokes,
+                 submitted,
+                 user
+            FROM leaderboard
+        ), summed_leaderboard AS (
+          SELECT user,
+                 COUNT(*)       holes,
+                 SUM(points)    points,
+                 SUM(strokes)   strokes,
+                 MAX(submitted) submitted
+            FROM scored_leaderboard
+        GROUP BY user
+        ) SELECT user,
+                 '' lang,
+                 points,
+                 RANK() OVER (ORDER BY points DESC, strokes),
+                 holes,
+                 strokes,
+                 submitted
+            FROM summed_leaderboard
+        ORDER BY points DESC, strokes, submitted'''
+    return [LeaderboardEntry(*item) for item in cursor.execute(query, [lang])]
+
+
+def get_leaderboard(cursor, hole='all-holes', lang='all-langs') -> List[LeaderboardEntry]:
+    """Get leaderboard entries for a hole or for the overall leaderboard."""
+    if hole == 'all-holes':
+        return get_overall_leaderboard(cursor, lang)
+    query = '''
+        WITH leaderboard AS (
+          SELECT hole,
+                 submitted,
+                 strokes,
+                 user,
+                 lang
+            FROM solutions
+           WHERE hole = ?
+             AND ? IN ('all-langs', lang)
+        ), scored_leaderboard AS (
+          SELECT hole,
+                 ROUND(
+                     (COUNT(*) OVER (PARTITION BY hole) -
+                        RANK() OVER (PARTITION BY hole ORDER BY strokes) + 1)
+                     * (1000.0 / COUNT(*) OVER (PARTITION BY hole))
+                 ) points,
+                 strokes,
+                 submitted,
+                 user,
+                 lang
+            FROM leaderboard
+        ) SELECT user,
+                 lang,
+                 points,
+                 RANK() OVER (ORDER BY points DESC, strokes),
+                 1 holes,
+                 strokes,
+                 submitted
+            FROM scored_leaderboard
+        ORDER BY points DESC, strokes, submitted'''
+    return [LeaderboardEntry(*item) for item in cursor.execute(query, [hole, lang])]
 
 
 def get_column_reference(headers, name):
@@ -243,7 +245,7 @@ def get_column_range_reference(headers, name):
     return f'{reference}:{reference}'
 
 
-def write_all_holes_worksheet(cursor, users, worksheet, formats):
+def write_all_holes_worksheet(cursor, worksheet, formats): # pylint: disable=too-many-locals
     """Write a worksheet for all-holes."""
     worksheet.freeze_panes(1, 0)
     headers = ['User', 'New Score', 'New Rank', 'Old Score', 'Old Rank', 'Δ Score', 'Δ Rank',
@@ -254,12 +256,26 @@ def write_all_holes_worksheet(cursor, users, worksheet, formats):
     for index, item in enumerate(headers):
         worksheet.write(0, index, item)
 
-    results = list(cursor.execute(
-        'select user, total_score, holes, strokes from total_scores order by total_score desc'))
+    results = list(cursor.execute('''
+        SELECT user,
+               total_score,
+               holes,
+               strokes,
+               RANK() OVER (ORDER BY total_score DESC) rank
+          FROM total_scores
+      ORDER BY total_score DESC'''))
+
+    old_results = {entry.user: entry for entry in get_leaderboard(cursor)}
+
     for index, item in enumerate(results):
-        user = users[item[0]]
-        assert user.holes == item[2]
-        data = [user.name, item[1], index + 1, user.score, user.rank, 0, 0, item[3], user.holes]
+        user = item[0]
+        total_score = item[1]
+        holes = item[2]
+        strokes = item[3]
+        rank = item[4]
+        old_entry = old_results[user]
+        assert old_entry.user == user and old_entry.holes == holes and old_entry.strokes == strokes
+        data = [user, total_score, rank, old_entry.points, old_entry.rank, 0, 0, strokes, holes]
         for column_index, column in enumerate(data):
             worksheet.write(index + 1, column_index, column, formats.get(headers[column_index]))
 
@@ -280,7 +296,7 @@ def floor_with_tolerance(num):
     return floor(num)
 
 
-def get_chars_to_rank_up(chars, new_rank, score_for_rank, n, m, sa, s, sb):
+def get_chars_to_rank_up(chars, new_rank, score_for_rank, n, m, sa, s, sb): # pylint: disable=invalid-name, too-many-arguments
     """Determine the number of characters needed to achieve a given rank."""
     target_score = None
     target_rank = new_rank - 1
@@ -307,22 +323,24 @@ def get_chars_to_rank_up(chars, new_rank, score_for_rank, n, m, sa, s, sb):
     return to_rank_up
 
 
-def write_hole_worksheet(cursor, hole, worksheet, formats):
+def write_hole_worksheet(cursor, hole, worksheet, formats): # pylint: disable=too-many-locals
     """Write a worksheet for a specific hole."""
-    query = '''select user,
-            language,
-            N,
-            M,
-            S,
-            Sa,
-            Sb,
-            size,
-            new_score,
-            old_score,
-            old_rank from scores
-            where hole = ?
-            order by new_score desc, old_sort_index'''
+    query = '''
+        SELECT user,
+               lang,
+               N,
+               M,
+               S,
+               Sa,
+               Sb,
+               strokes,
+               new_score
+          FROM scores
+         WHERE hole = ?
+      ORDER BY new_score DESC, submitted'''
     results = list(cursor.execute(query, [hole]))
+    old_results = {(entry.user, entry.lang): entry for entry in get_leaderboard(cursor, hole)}
+
     headers = ['User', 'Language', 'Chars', 'New Score', 'New Rank', 'Old Score', 'Old Rank',
                'Δ Score', 'Δ Rank', 'To Rank Up', 'Lang. Sb', 'Lang. S', 'All S', 'Lang. N',
                'Lang. M']
@@ -349,8 +367,7 @@ def write_hole_worksheet(cursor, hole, worksheet, formats):
         sb = item[6] # pylint: disable=invalid-name
         chars = item[7]
         new_score = item[8]
-        old_score = item[9]
-        old_rank = item[10]
+        old_entry = old_results[user, language]
 
         if last_rank and isclose(new_score, score_for_rank[last_rank]):
             new_rank = last_rank
@@ -363,7 +380,7 @@ def write_hole_worksheet(cursor, hole, worksheet, formats):
             to_rank_up = get_chars_to_rank_up(
                 chars, new_rank, score_for_rank, n, m, sa, s, sb)
 
-        data = [user, language, chars, 0, new_rank, old_score, old_rank, 0, 0,
+        data = [user, language, chars, 0, new_rank, old_entry.points, old_entry.rank, 0, 0,
                 to_rank_up, sb, s, sa, n, m]
 
         for column_index, column in enumerate(data):
@@ -386,7 +403,7 @@ def write_hole_worksheet(cursor, hole, worksheet, formats):
         set_column_value('Lang. Sb', sb_formula)
 
 
-def make_spreadsheet(cursor, workbook, holes, users):
+def make_spreadsheet(cursor, workbook, holes):
     """Write a spreadsheet showing how the Bayesian scoring method will affect things."""
     number_format1 = workbook.add_format({'num_format': '0.000'})
     number_format2 = workbook.add_format({'num_format': '0.00'})
@@ -399,7 +416,7 @@ def make_spreadsheet(cursor, workbook, holes, users):
                'Δ Rank': number_format4,
                'Strokes/Hole': number_format1}
 
-    write_all_holes_worksheet(cursor, users, workbook.add_worksheet('all-holes'), formats)
+    write_all_holes_worksheet(cursor, workbook.add_worksheet('all-holes'), formats)
 
     for hole in sorted(holes):
         worksheet = workbook.add_worksheet(hole[:31])
@@ -418,15 +435,18 @@ def _main():
         os.mkdir(os.path.join(DIR, 'scores'))
     except FileExistsError:
         pass
+    time1 = time()
     if args.local:
         print("Using local cache.")
     else:
         print("Downloading new files. Please wait.")
-    holes, users = get_holes_and_users(args.local)
+    all_solutions = get_all_solutions(args.local)
+    print(f'Loaded data in {time() - time1:.1f} seconds.')
+    holes = {solution.hole for solution in all_solutions}
+    user_count = len({solution.user for solution in all_solutions})
     print(f'Got {len(holes)} holes.')
-    print(f'Got total scores for {len(users):,} users.')
-    all_solutions = get_all_solutions(args.local, holes)
-    print(f'Got {sum(len(s) for s in all_solutions.values()):,} solutions.')
+    print(f'Got {user_count} users.')
+    print(f'Got {len(all_solutions)} solutions.')
     db_filename = os.path.join(DIR, 'scores.db')
     try:
         os.unlink(db_filename)
@@ -437,7 +457,7 @@ def _main():
     make_database(cursor, all_solutions)
     filename = os.path.join(DIR, 'bayesian.xlsx')
     workbook = xlsxwriter.Workbook(filename)
-    make_spreadsheet(cursor, workbook, holes, users)
+    make_spreadsheet(cursor, workbook, holes)
     workbook.close()
     print(f'Wrote file: {filename}')
     connection.commit()
